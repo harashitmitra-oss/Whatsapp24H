@@ -1,7 +1,8 @@
 import re
+import os
 import html
 from io import BytesIO
-from datetime import datetime, date, timedelta
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -14,16 +15,17 @@ import streamlit as st
 # =========================
 
 st.set_page_config(
-    page_title="WhatsApp Community 24H Report",
+    page_title="WhatsApp Community Report",
     page_icon="💬",
     layout="wide"
 )
 
 APP_TITLE = "WhatsApp Community Daily Intelligence Report"
+STUDENT_PHONE_FILE = "students_phone.xlsx"
 
 
 # =========================
-# TOPIC / SENTIMENT RULES
+# KEYWORD RULES
 # =========================
 
 TOPIC_KEYWORDS = {
@@ -95,28 +97,194 @@ ANNOUNCEMENT_KEYWORDS = [
 
 
 # =========================
-# PARSING HELPERS
+# PHONE MATCHING
+# =========================
+
+def normalize_phone(value):
+    """
+    Normalize phone numbers for matching.
+
+    Examples:
+    +91 98765 43210 -> 919876543210
+    9876543210 -> 9876543210
+    +1 (805) 878-6137 -> 18058786137
+    """
+    if pd.isna(value):
+        return ""
+
+    text = str(value).strip()
+    digits = re.sub(r"\D+", "", text)
+
+    if not digits:
+        return ""
+
+    # Remove leading 00 international prefix.
+    if digits.startswith("00"):
+        digits = digits[2:]
+
+    return digits
+
+
+def phone_match_keys(value):
+    """
+    Create multiple keys for robust matching.
+    Exact full number + last 10 digits.
+    """
+    normalized = normalize_phone(value)
+
+    if not normalized:
+        return []
+
+    keys = {normalized}
+
+    if len(normalized) >= 10:
+        keys.add(normalized[-10:])
+
+    if len(normalized) >= 11:
+        keys.add(normalized[-11:])
+
+    return list(keys)
+
+
+def extract_phone_from_sender(sender):
+    """
+    Extract phone number from WhatsApp sender field.
+    Sender can be:
+    +91 98765 43210
+    +1 (805) 878-6137
+    Harashit Mitra
+    """
+    sender = str(sender).strip()
+
+    # Only treat as phone-like if it has at least 8 digits.
+    digits = re.sub(r"\D+", "", sender)
+
+    if len(digits) >= 8:
+        return normalize_phone(sender)
+
+    return ""
+
+
+@st.cache_data(show_spinner=False)
+def load_students_phone_mapping(file_path=STUDENT_PHONE_FILE):
+    """
+    Reads students_phone.xlsx from repo and creates phone -> student mapping.
+    Auto-detects name and phone columns.
+    """
+    if not os.path.exists(file_path):
+        return {}, pd.DataFrame(), "students_phone.xlsx not found in repo."
+
+    try:
+        students_df = pd.read_excel(file_path)
+    except Exception as e:
+        return {}, pd.DataFrame(), f"Could not read students_phone.xlsx: {e}"
+
+    if students_df.empty:
+        return {}, students_df, "students_phone.xlsx is empty."
+
+    original_cols = list(students_df.columns)
+    lower_cols = {str(c).strip().lower(): c for c in students_df.columns}
+
+    name_candidates = [
+        "student name", "name", "full name", "student", "student_name",
+        "full_name", "lead name", "candidate name"
+    ]
+
+    phone_candidates = [
+        "phone", "phone number", "mobile", "mobile number",
+        "whatsapp", "whatsapp number", "contact", "number",
+        "contact number", "phone_number", "mobile_number"
+    ]
+
+    name_col = None
+    phone_col = None
+
+    for c in name_candidates:
+        if c in lower_cols:
+            name_col = lower_cols[c]
+            break
+
+    for c in phone_candidates:
+        if c in lower_cols:
+            phone_col = lower_cols[c]
+            break
+
+    if name_col is None:
+        return {}, students_df, f"Could not detect student name column. Found columns: {original_cols}"
+
+    if phone_col is None:
+        return {}, students_df, f"Could not detect phone column. Found columns: {original_cols}"
+
+    mapping = {}
+
+    for _, row in students_df.iterrows():
+        student_name = str(row.get(name_col, "")).strip()
+        phone_value = row.get(phone_col, "")
+
+        if not student_name or student_name.lower() in ["nan", "none"]:
+            continue
+
+        for key in phone_match_keys(phone_value):
+            if key:
+                mapping[key] = student_name
+
+    students_df["_Detected_Name_Column"] = name_col
+    students_df["_Detected_Phone_Column"] = phone_col
+
+    return mapping, students_df, ""
+
+
+def match_student_name(sender, phone_mapping):
+    sender_phone = extract_phone_from_sender(sender)
+
+    if not sender_phone:
+        return ""
+
+    keys = phone_match_keys(sender_phone)
+
+    for key in keys:
+        if key in phone_mapping:
+            return phone_mapping[key]
+
+    return ""
+
+
+def enrich_with_student_names(df, phone_mapping):
+    df = df.copy()
+
+    df["SenderPhone"] = df["Sender"].apply(extract_phone_from_sender)
+    df["MatchedStudentName"] = df["Sender"].apply(lambda x: match_student_name(x, phone_mapping))
+
+    df["DisplayName"] = np.where(
+        df["MatchedStudentName"].astype(str).str.strip() != "",
+        df["MatchedStudentName"],
+        df["Sender"]
+    )
+
+    df["IsStudentMatched"] = df["MatchedStudentName"].astype(str).str.strip() != ""
+
+    return df
+
+
+# =========================
+# FILE / PARSING HELPERS
 # =========================
 
 def decode_file(uploaded_file):
     raw = uploaded_file.read()
+
     for enc in ["utf-8", "utf-8-sig", "utf-16", "latin-1"]:
         try:
             return raw.decode(enc)
         except Exception:
             continue
+
     return raw.decode("utf-8", errors="ignore")
 
 
 def parse_datetime(date_str, time_str):
-    """
-    Supports common WhatsApp formats:
-    12/03/2026, 18:30
-    12/03/26, 6:30 PM
-    03/12/2026, 18:30
-    """
-    date_str = date_str.strip()
-    time_str = time_str.strip().replace("\u202f", " ")
+    date_str = str(date_str).strip()
+    time_str = str(time_str).strip().replace("\u202f", " ")
 
     candidates = [
         f"{date_str} {time_str}",
@@ -137,10 +305,6 @@ def parse_datetime(date_str, time_str):
 
 
 def split_sender_message(body):
-    """
-    If body contains 'Sender: Message', split it.
-    Otherwise treat as system message.
-    """
     if ": " in body:
         sender, message = body.split(": ", 1)
         return sender.strip(), message.strip(), False
@@ -150,15 +314,14 @@ def split_sender_message(body):
 
 def parse_whatsapp_export(text, community_name):
     """
-    Handles Android and iPhone exports:
+    Supports common Android and iPhone WhatsApp exports.
+
     Android:
     12/03/2026, 18:30 - Name: Message
 
     iPhone:
     [12/03/2026, 18:30:00] Name: Message
     [12/03/26, 6:30:00 PM] Name: Message
-
-    Also supports multiline messages.
     """
 
     patterns = [
@@ -177,12 +340,11 @@ def parse_whatsapp_export(text, community_name):
     rows = []
     current = None
 
-    lines = text.splitlines()
-
-    for line in lines:
+    for line in text.splitlines():
         line = line.strip("\ufeff").rstrip()
 
         matched = None
+
         for pattern in patterns:
             m = pattern.match(line)
             if m:
@@ -205,6 +367,7 @@ def parse_whatsapp_export(text, community_name):
                 "IsSystem": is_system,
                 "RawLine": line
             }
+
         else:
             if current is not None:
                 current["Message"] += "\n" + line
@@ -227,6 +390,10 @@ def parse_whatsapp_export(text, community_name):
         return df
 
     df = df.dropna(subset=["DateTime"]).copy()
+
+    if df.empty:
+        return df
+
     df["DateTime"] = pd.to_datetime(df["DateTime"])
     df["Date"] = df["DateTime"].dt.date
     df["Time"] = df["DateTime"].dt.strftime("%H:%M")
@@ -274,8 +441,10 @@ def sentiment_label(message):
 
     if neg > pos:
         return "Negative"
+
     if pos > neg:
         return "Positive"
+
     return "Neutral"
 
 
@@ -285,6 +454,7 @@ def has_link(message):
 
 def is_media(message):
     text = str(message).lower()
+
     media_markers = [
         "<media omitted>",
         "image omitted",
@@ -295,6 +465,7 @@ def is_media(message):
         "document omitted",
         "voice message omitted"
     ]
+
     return any(marker in text for marker in media_markers)
 
 
@@ -305,20 +476,22 @@ def is_deleted(message):
 
 def is_join_event(message):
     text = str(message).lower()
+
     return (
         "joined using this group's invite link" in text
         or "joined using this community's invite link" in text
         or "was added" in text
-        or "added" in text
+        or " added " in f" {text} "
     )
 
 
 def is_left_event(message):
     text = str(message).lower()
+
     return (
-        "left" in text
+        " left" in text
         or "was removed" in text
-        or "removed" in text
+        or " removed " in f" {text} "
     )
 
 
@@ -341,12 +514,8 @@ def extract_features(df):
 
 
 def mark_answered_questions(df, admin_names=None, response_window_hours=4):
-    """
-    Marks questions as answered when:
-    - If admin list is provided: an admin replies after the question in same community within window.
-    - If no admin list: any different sender replies after the question within window.
-    """
     df = df.copy()
+
     df["QuestionAnswered"] = False
     df["AnsweredBy"] = ""
     df["NeedsFollowUp"] = False
@@ -373,21 +542,28 @@ def mark_answered_questions(df, admin_names=None, response_window_hours=4):
             continue
 
         if admin_names:
-            future["SenderLower"] = future["Sender"].str.lower().str.strip()
-            admin_reply = future[future["SenderLower"].isin(admin_names)]
+            future["DisplayLower"] = future["DisplayName"].astype(str).str.lower().str.strip()
+            future["SenderLower"] = future["Sender"].astype(str).str.lower().str.strip()
+
+            admin_reply = future[
+                future["DisplayLower"].isin(admin_names)
+                | future["SenderLower"].isin(admin_names)
+            ]
 
             if not admin_reply.empty:
                 first_reply = admin_reply.iloc[0]
                 df.at[idx, "QuestionAnswered"] = True
-                df.at[idx, "AnsweredBy"] = first_reply["Sender"]
+                df.at[idx, "AnsweredBy"] = first_reply["DisplayName"]
             else:
                 df.at[idx, "NeedsFollowUp"] = True
+
         else:
             future = future[future["Sender"] != row["Sender"]]
+
             if not future.empty:
                 first_reply = future.iloc[0]
                 df.at[idx, "QuestionAnswered"] = True
-                df.at[idx, "AnsweredBy"] = first_reply["Sender"]
+                df.at[idx, "AnsweredBy"] = first_reply["DisplayName"]
             else:
                 df.at[idx, "NeedsFollowUp"] = True
 
@@ -397,78 +573,6 @@ def mark_answered_questions(df, admin_names=None, response_window_hours=4):
 # =========================
 # METRICS
 # =========================
-
-def build_daily_community_metrics(df):
-    if df.empty:
-        return pd.DataFrame()
-
-    grouped = df.groupby(["Date", "Community"], dropna=False)
-
-    records = []
-
-    for (dt, community), g in grouped:
-        non_system = g[~g["IsSystem"]]
-
-        questions = g[g["IsQuestion"] & (~g["IsSystem"])]
-        answered = questions[questions["QuestionAnswered"]]
-        unanswered = questions[~questions["QuestionAnswered"]]
-
-        sentiment_counts = non_system["Sentiment"].value_counts().to_dict()
-
-        top_topic = "General"
-        topic_counts = non_system["TopicPrimary"].value_counts()
-        if not topic_counts.empty:
-            top_topic = topic_counts.index[0]
-
-        active_members = non_system["Sender"].nunique()
-
-        peak_hour = ""
-        hour_counts = non_system["Hour"].value_counts()
-        if not hour_counts.empty:
-            peak_hour = int(hour_counts.idxmax())
-
-        negative_cases = non_system[non_system["Sentiment"] == "Negative"].shape[0]
-        high_intent = non_system[non_system["IsHighIntent"]].shape[0]
-
-        total_messages = len(non_system)
-        questions_count = len(questions)
-
-        health_score = calculate_health_score(
-            total_messages=total_messages,
-            active_members=active_members,
-            unanswered=len(unanswered),
-            negative_cases=negative_cases,
-            high_intent=high_intent,
-            questions=questions_count
-        )
-
-        records.append({
-            "Date": dt,
-            "Community": community,
-            "Total Messages": total_messages,
-            "Active Members": active_members,
-            "System Messages": int(g["IsSystem"].sum()),
-            "New Member Events": int(g["IsJoinEvent"].sum()),
-            "Left / Removed Events": int(g["IsLeftEvent"].sum()),
-            "Media Shared": int(g["IsMedia"].sum()),
-            "Links Shared": int(g["HasLink"].sum()),
-            "Deleted Messages": int(g["IsDeleted"].sum()),
-            "Questions Asked": len(questions),
-            "Questions Answered": len(answered),
-            "Unanswered Questions": len(unanswered),
-            "High Intent Messages": high_intent,
-            "Negative Cases": negative_cases,
-            "Positive Messages": sentiment_counts.get("Positive", 0),
-            "Neutral Messages": sentiment_counts.get("Neutral", 0),
-            "Negative Messages": sentiment_counts.get("Negative", 0),
-            "Peak Activity Hour": peak_hour,
-            "Main Topic": top_topic,
-            "Community Health Score": health_score,
-            "Overall Health": health_label(health_score)
-        })
-
-    return pd.DataFrame(records).sort_values(["Date", "Community"])
-
 
 def calculate_health_score(
     total_messages,
@@ -496,6 +600,7 @@ def calculate_health_score(
 
     if questions > 0:
         unanswered_rate = unanswered / questions
+
         if unanswered_rate <= 0.1:
             score += 10
         elif unanswered_rate <= 0.3:
@@ -526,20 +631,91 @@ def health_label(score):
     return "Risk"
 
 
+def build_daily_community_metrics(df):
+    if df.empty:
+        return pd.DataFrame()
+
+    grouped = df.groupby(["Date", "Community"], dropna=False)
+    records = []
+
+    for (dt, community), g in grouped:
+        non_system = g[~g["IsSystem"]]
+
+        questions = g[g["IsQuestion"] & (~g["IsSystem"])]
+        answered = questions[questions["QuestionAnswered"]]
+        unanswered = questions[~questions["QuestionAnswered"]]
+
+        sentiment_counts = non_system["Sentiment"].value_counts().to_dict()
+
+        topic_counts = non_system["TopicPrimary"].value_counts()
+        top_topic = topic_counts.index[0] if not topic_counts.empty else "General"
+
+        active_members = non_system["DisplayName"].nunique()
+
+        hour_counts = non_system["Hour"].value_counts()
+        peak_hour = int(hour_counts.idxmax()) if not hour_counts.empty else ""
+
+        negative_cases = non_system[non_system["Sentiment"] == "Negative"].shape[0]
+        high_intent = non_system[non_system["IsHighIntent"]].shape[0]
+        total_messages = len(non_system)
+        questions_count = len(questions)
+
+        health_score = calculate_health_score(
+            total_messages=total_messages,
+            active_members=active_members,
+            unanswered=len(unanswered),
+            negative_cases=negative_cases,
+            high_intent=high_intent,
+            questions=questions_count
+        )
+
+        matched_students = non_system["IsStudentMatched"].sum()
+        unique_matched_students = non_system[non_system["IsStudentMatched"]]["MatchedStudentName"].nunique()
+
+        records.append({
+            "Date": dt,
+            "Community": community,
+            "Total Messages": total_messages,
+            "Active Members": active_members,
+            "Matched Student Messages": int(matched_students),
+            "Unique Matched Students": int(unique_matched_students),
+            "System Messages": int(g["IsSystem"].sum()),
+            "New Member Events": int(g["IsJoinEvent"].sum()),
+            "Left / Removed Events": int(g["IsLeftEvent"].sum()),
+            "Media Shared": int(g["IsMedia"].sum()),
+            "Links Shared": int(g["HasLink"].sum()),
+            "Deleted Messages": int(g["IsDeleted"].sum()),
+            "Questions Asked": len(questions),
+            "Questions Answered": len(answered),
+            "Unanswered Questions": len(unanswered),
+            "High Intent Messages": high_intent,
+            "Negative Cases": negative_cases,
+            "Positive Messages": sentiment_counts.get("Positive", 0),
+            "Neutral Messages": sentiment_counts.get("Neutral", 0),
+            "Negative Messages": sentiment_counts.get("Negative", 0),
+            "Peak Activity Hour": peak_hour,
+            "Main Topic": top_topic,
+            "Community Health Score": health_score,
+            "Overall Health": health_label(health_score)
+        })
+
+    return pd.DataFrame(records).sort_values(["Date", "Community"])
+
+
 def build_topic_summary(df):
     if df.empty:
         return pd.DataFrame()
 
     exploded = df[~df["IsSystem"]].explode("Topics")
-    summary = (
+
+    return (
         exploded
         .groupby(["Date", "Community", "Topics"])
         .size()
         .reset_index(name="Message Count")
+        .rename(columns={"Topics": "Topic"})
         .sort_values(["Date", "Community", "Message Count"], ascending=[True, True, False])
     )
-
-    return summary.rename(columns={"Topics": "Topic"})
 
 
 def build_top_members(df):
@@ -550,7 +726,7 @@ def build_top_members(df):
 
     return (
         non_system
-        .groupby(["Date", "Community", "Sender"])
+        .groupby(["Date", "Community", "DisplayName", "Sender", "MatchedStudentName", "IsStudentMatched"])
         .size()
         .reset_index(name="Messages")
         .sort_values(["Date", "Community", "Messages"], ascending=[True, True, False])
@@ -570,7 +746,52 @@ def build_hourly_summary(df):
     )
 
 
-def get_important_messages(df, limit=100):
+def get_questions_tracker(df):
+    q = df[(~df["IsSystem"]) & (df["IsQuestion"])].copy()
+
+    if q.empty:
+        return pd.DataFrame(columns=[
+            "Date", "Time", "Community", "DisplayName", "Sender",
+            "MatchedStudentName", "Message", "QuestionAnswered", "AnsweredBy", "NeedsFollowUp"
+        ])
+
+    return q[[
+        "Date", "Time", "Community", "DisplayName", "Sender",
+        "MatchedStudentName", "Message", "QuestionAnswered", "AnsweredBy", "NeedsFollowUp"
+    ]].sort_values(["Date", "Time", "Community"])
+
+
+def get_high_intent_tracker(df):
+    h = df[(~df["IsSystem"]) & (df["IsHighIntent"])].copy()
+
+    if h.empty:
+        return pd.DataFrame(columns=[
+            "Date", "Time", "Community", "DisplayName", "Sender",
+            "MatchedStudentName", "Message", "Sentiment"
+        ])
+
+    return h[[
+        "Date", "Time", "Community", "DisplayName", "Sender",
+        "MatchedStudentName", "Message", "Sentiment"
+    ]].sort_values(["Date", "Time", "Community"])
+
+
+def get_negative_tracker(df):
+    n = df[(~df["IsSystem"]) & (df["Sentiment"] == "Negative")].copy()
+
+    if n.empty:
+        return pd.DataFrame(columns=[
+            "Date", "Time", "Community", "DisplayName", "Sender",
+            "MatchedStudentName", "Message"
+        ])
+
+    return n[[
+        "Date", "Time", "Community", "DisplayName", "Sender",
+        "MatchedStudentName", "Message"
+    ]].sort_values(["Date", "Time", "Community"])
+
+
+def get_important_messages(df, limit=200):
     if df.empty:
         return pd.DataFrame()
 
@@ -582,6 +803,13 @@ def get_important_messages(df, limit=100):
             | (df["Sentiment"] == "Negative")
         )
     ].copy()
+
+    if important.empty:
+        return pd.DataFrame(columns=[
+            "Date", "Time", "Community", "DisplayName", "Sender",
+            "MatchedStudentName", "Category", "Sentiment",
+            "QuestionAnswered", "NeedsFollowUp", "Message"
+        ])
 
     important["Category"] = np.select(
         [
@@ -598,52 +826,12 @@ def get_important_messages(df, limit=100):
     )
 
     cols = [
-        "Date", "Time", "Community", "Sender", "Category",
-        "Sentiment", "QuestionAnswered", "NeedsFollowUp", "Message"
+        "Date", "Time", "Community", "DisplayName", "Sender",
+        "MatchedStudentName", "Category", "Sentiment",
+        "QuestionAnswered", "NeedsFollowUp", "Message"
     ]
 
     return important[cols].sort_values(["Date", "Time"]).head(limit)
-
-
-def get_questions_tracker(df):
-    q = df[(~df["IsSystem"]) & (df["IsQuestion"])].copy()
-
-    if q.empty:
-        return pd.DataFrame(columns=[
-            "Date", "Time", "Community", "Sender", "Message",
-            "QuestionAnswered", "AnsweredBy", "NeedsFollowUp"
-        ])
-
-    return q[[
-        "Date", "Time", "Community", "Sender", "Message",
-        "QuestionAnswered", "AnsweredBy", "NeedsFollowUp"
-    ]].sort_values(["Date", "Time", "Community"])
-
-
-def get_high_intent_tracker(df):
-    h = df[(~df["IsSystem"]) & (df["IsHighIntent"])].copy()
-
-    if h.empty:
-        return pd.DataFrame(columns=[
-            "Date", "Time", "Community", "Sender", "Message", "Sentiment"
-        ])
-
-    return h[[
-        "Date", "Time", "Community", "Sender", "Message", "Sentiment"
-    ]].sort_values(["Date", "Time", "Community"])
-
-
-def get_negative_tracker(df):
-    n = df[(~df["IsSystem"]) & (df["Sentiment"] == "Negative")].copy()
-
-    if n.empty:
-        return pd.DataFrame(columns=[
-            "Date", "Time", "Community", "Sender", "Message"
-        ])
-
-    return n[[
-        "Date", "Time", "Community", "Sender", "Message"
-    ]].sort_values(["Date", "Time", "Community"])
 
 
 def detect_admin_announcements(df, admin_names=None):
@@ -651,23 +839,73 @@ def detect_admin_announcements(df, admin_names=None):
     data = df[~df["IsSystem"]].copy()
 
     if admin_names:
-        data = data[data["Sender"].str.lower().str.strip().isin(admin_names)]
+        data["DisplayLower"] = data["DisplayName"].astype(str).str.lower().str.strip()
+        data["SenderLower"] = data["Sender"].astype(str).str.lower().str.strip()
+
+        data = data[
+            data["DisplayLower"].isin(admin_names)
+            | data["SenderLower"].isin(admin_names)
+        ]
 
     data = data[data["Message"].apply(lambda x: contains_any(x, ANNOUNCEMENT_KEYWORDS))]
 
     if data.empty:
         return pd.DataFrame(columns=[
-            "Date", "Time", "Community", "Sender", "Message"
+            "Date", "Time", "Community", "DisplayName", "Sender", "Message"
         ])
 
     return data[[
-        "Date", "Time", "Community", "Sender", "Message"
+        "Date", "Time", "Community", "DisplayName", "Sender", "Message"
     ]].sort_values(["Date", "Time", "Community"])
 
 
 # =========================
-# REPORT EXPORTS
+# EXPORT HELPERS
 # =========================
+
+def clean_for_excel(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+
+    for col in out.columns:
+        if out[col].dtype == "object":
+            out[col] = out[col].astype(str)
+
+    return out
+
+
+def build_excel_report(
+    metrics_df,
+    topic_summary,
+    top_members,
+    questions_df,
+    high_intent_df,
+    negative_df,
+    important_df,
+    admin_announcements,
+    raw_df
+):
+    output = BytesIO()
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        clean_for_excel(metrics_df).to_excel(writer, sheet_name="Daily Metrics", index=False)
+        clean_for_excel(topic_summary).to_excel(writer, sheet_name="Topic Summary", index=False)
+        clean_for_excel(top_members).to_excel(writer, sheet_name="Top Members", index=False)
+        clean_for_excel(questions_df).to_excel(writer, sheet_name="Questions", index=False)
+        clean_for_excel(high_intent_df).to_excel(writer, sheet_name="High Intent", index=False)
+        clean_for_excel(negative_df).to_excel(writer, sheet_name="Negative Cases", index=False)
+        clean_for_excel(important_df).to_excel(writer, sheet_name="Important Messages", index=False)
+        clean_for_excel(admin_announcements).to_excel(writer, sheet_name="Admin Announcements", index=False)
+
+        export_raw = raw_df.copy()
+        export_raw["Topics"] = export_raw["Topics"].astype(str)
+        clean_for_excel(export_raw).to_excel(writer, sheet_name="Parsed Raw Data", index=False)
+
+    output.seek(0)
+    return output
+
 
 def df_to_html_table(df, title):
     if df is None or df.empty:
@@ -692,6 +930,7 @@ def df_to_html_table(df, title):
 
 
 def build_html_report(
+    title,
     filtered_df,
     metrics_df,
     topic_summary,
@@ -707,18 +946,21 @@ def build_html_report(
     generated_at = datetime.now().strftime("%d %b %Y, %I:%M %p")
 
     total_messages = int(metrics_df["Total Messages"].sum()) if not metrics_df.empty else 0
-    active_members = filtered_df[~filtered_df["IsSystem"]]["Sender"].nunique() if not filtered_df.empty else 0
+    active_members = filtered_df[~filtered_df["IsSystem"]]["DisplayName"].nunique() if not filtered_df.empty else 0
     total_questions = int(metrics_df["Questions Asked"].sum()) if not metrics_df.empty else 0
     unanswered = int(metrics_df["Unanswered Questions"].sum()) if not metrics_df.empty else 0
     high_intent = int(metrics_df["High Intent Messages"].sum()) if not metrics_df.empty else 0
     negative = int(metrics_df["Negative Cases"].sum()) if not metrics_df.empty else 0
+    matched_students = filtered_df[
+        (~filtered_df["IsSystem"]) & (filtered_df["IsStudentMatched"])
+    ]["MatchedStudentName"].nunique() if not filtered_df.empty else 0
 
     html_report = f"""
     <!DOCTYPE html>
     <html>
     <head>
         <meta charset="utf-8">
-        <title>{html.escape(APP_TITLE)}</title>
+        <title>{html.escape(title)}</title>
         <style>
             body {{
                 font-family: Arial, Helvetica, sans-serif;
@@ -749,7 +991,7 @@ def build_html_report(
             }}
             .kpi-grid {{
                 display: grid;
-                grid-template-columns: repeat(6, 1fr);
+                grid-template-columns: repeat(7, 1fr);
                 gap: 14px;
                 margin-bottom: 26px;
             }}
@@ -830,7 +1072,7 @@ def build_html_report(
     <body>
         <div class="container">
             <div class="header">
-                <h1>{html.escape(APP_TITLE)}</h1>
+                <h1>{html.escape(title)}</h1>
                 <p><strong>Reporting Period:</strong> {start_date.strftime("%d %b %Y")} to {end_date.strftime("%d %b %Y")}</p>
                 <p><strong>Generated:</strong> {generated_at}</p>
             </div>
@@ -838,6 +1080,7 @@ def build_html_report(
             <div class="kpi-grid">
                 <div class="kpi"><div class="label">Messages</div><div class="value">{total_messages}</div></div>
                 <div class="kpi"><div class="label">Active Members</div><div class="value">{active_members}</div></div>
+                <div class="kpi"><div class="label">Matched Students</div><div class="value">{matched_students}</div></div>
                 <div class="kpi"><div class="label">Questions</div><div class="value">{total_questions}</div></div>
                 <div class="kpi"><div class="label">Unanswered</div><div class="value">{unanswered}</div></div>
                 <div class="kpi"><div class="label">High Intent</div><div class="value">{high_intent}</div></div>
@@ -847,23 +1090,19 @@ def build_html_report(
             <section>
                 <h2>Executive Summary</h2>
                 <p>
-                    This report summarises WhatsApp community activity for the selected reporting period.
-                    It includes message activity, active members, topic trends, questions, high-intent signals,
-                    negative sentiment cases, admin announcements, and pending follow-ups.
-                </p>
-                <p>
-                    <strong>Recommended focus:</strong>
-                    prioritize unanswered questions, high-intent members, and negative sentiment cases for follow-up.
+                    This report summarises WhatsApp community activity for the selected period.
+                    It includes message activity, active members, matched student names, topics, questions,
+                    high-intent signals, negative sentiment cases, announcements, and pending follow-ups.
                 </p>
             </section>
 
-            {df_to_html_table(metrics_df, "Community-Wise Daily Performance")}
+            {df_to_html_table(metrics_df, "Daily Performance")}
             {df_to_html_table(topic_summary, "Topic Summary")}
             {df_to_html_table(top_members.head(50), "Top Active Members")}
             {df_to_html_table(questions_df, "Questions Tracker")}
             {df_to_html_table(high_intent_df, "High Intent / Lead Signals")}
             {df_to_html_table(negative_df, "Negative Sentiment / Risk Cases")}
-            {df_to_html_table(admin_announcements, "Admin Announcements / Important Updates")}
+            {df_to_html_table(admin_announcements, "Admin Announcements")}
             {df_to_html_table(important_df, "Important Conversations")}
 
             <div class="footer">
@@ -877,200 +1116,46 @@ def build_html_report(
     return html_report
 
 
-def build_excel_report(
-    metrics_df,
-    topic_summary,
-    top_members,
-    questions_df,
-    high_intent_df,
-    negative_df,
-    important_df,
-    admin_announcements,
-    raw_df
-):
-    output = BytesIO()
-
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        metrics_df.to_excel(writer, sheet_name="Daily Community Metrics", index=False)
-        topic_summary.to_excel(writer, sheet_name="Topic Summary", index=False)
-        top_members.to_excel(writer, sheet_name="Top Members", index=False)
-        questions_df.to_excel(writer, sheet_name="Questions Tracker", index=False)
-        high_intent_df.to_excel(writer, sheet_name="High Intent", index=False)
-        negative_df.to_excel(writer, sheet_name="Negative Cases", index=False)
-        important_df.to_excel(writer, sheet_name="Important Messages", index=False)
-        admin_announcements.to_excel(writer, sheet_name="Admin Announcements", index=False)
-
-        export_raw = raw_df.copy()
-        export_raw["Topics"] = export_raw["Topics"].astype(str)
-        export_raw.to_excel(writer, sheet_name="Parsed Raw Data", index=False)
-
-    output.seek(0)
-    return output
-
-
 # =========================
-# UI HELPERS
+# UI RENDERING
 # =========================
 
-def kpi_card(label, value, help_text=None):
-    st.metric(label, value, help=help_text)
-
-
-def render_overview_kpis(metrics_df, filtered_df):
+def render_kpis(metrics_df, filtered_df):
     total_messages = int(metrics_df["Total Messages"].sum()) if not metrics_df.empty else 0
-    active_members = filtered_df[~filtered_df["IsSystem"]]["Sender"].nunique() if not filtered_df.empty else 0
+    active_members = filtered_df[~filtered_df["IsSystem"]]["DisplayName"].nunique() if not filtered_df.empty else 0
+    matched_students = filtered_df[
+        (~filtered_df["IsSystem"]) & (filtered_df["IsStudentMatched"])
+    ]["MatchedStudentName"].nunique() if not filtered_df.empty else 0
     total_questions = int(metrics_df["Questions Asked"].sum()) if not metrics_df.empty else 0
     unanswered = int(metrics_df["Unanswered Questions"].sum()) if not metrics_df.empty else 0
     high_intent = int(metrics_df["High Intent Messages"].sum()) if not metrics_df.empty else 0
     negative = int(metrics_df["Negative Cases"].sum()) if not metrics_df.empty else 0
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
 
-    with c1:
-        kpi_card("Total Messages", total_messages)
-    with c2:
-        kpi_card("Active Members", active_members)
-    with c3:
-        kpi_card("Questions Asked", total_questions)
-    with c4:
-        kpi_card("Unanswered", unanswered)
-    with c5:
-        kpi_card("High Intent", high_intent)
-    with c6:
-        kpi_card("Negative Cases", negative)
+    c1.metric("Messages", total_messages)
+    c2.metric("Active Members", active_members)
+    c3.metric("Matched Students", matched_students)
+    c4.metric("Questions", total_questions)
+    c5.metric("Unanswered", unanswered)
+    c6.metric("High Intent", high_intent)
+    c7.metric("Negative Cases", negative)
 
 
-def render_two_day_comparison(metrics_df, selected_dates):
-    st.subheader("Two-Day Comparison")
-
-    if metrics_df.empty:
-        st.info("No data available for comparison.")
-        return
-
-    day1, day2 = sorted(selected_dates)
-
-    daily = (
-        metrics_df
-        .groupby("Date")
-        .sum(numeric_only=True)
-        .reset_index()
-    )
-
-    day1_row = daily[daily["Date"] == day1]
-    day2_row = daily[daily["Date"] == day2]
-
-    if day1_row.empty or day2_row.empty:
-        st.warning("One of the selected days has no data.")
-        return
-
-    comparison_metrics = [
-        "Total Messages",
-        "Active Members",
-        "Questions Asked",
-        "Questions Answered",
-        "Unanswered Questions",
-        "High Intent Messages",
-        "Negative Cases",
-        "Media Shared",
-        "Links Shared",
-        "New Member Events",
-        "Left / Removed Events"
-    ]
-
-    rows = []
-    for metric in comparison_metrics:
-        v1 = int(day1_row.iloc[0].get(metric, 0))
-        v2 = int(day2_row.iloc[0].get(metric, 0))
-        delta = v2 - v1
-        pct = ""
-        if v1 != 0:
-            pct = f"{((v2 - v1) / v1) * 100:.1f}%"
-
-        rows.append({
-            "Metric": metric,
-            day1.strftime("%d %b %Y"): v1,
-            day2.strftime("%d %b %Y"): v2,
-            "Change": delta,
-            "% Change": pct
-        })
-
-    comp_df = pd.DataFrame(rows)
-    st.dataframe(comp_df, use_container_width=True)
-
-    plot_df = metrics_df.groupby("Date")[
-        ["Total Messages", "Questions Asked", "High Intent Messages", "Negative Cases"]
-    ].sum().reset_index()
-
-    plot_long = plot_df.melt(id_vars="Date", var_name="Metric", value_name="Count")
-
-    fig = px.bar(
-        plot_long,
-        x="Metric",
-        y="Count",
-        color="Date",
-        barmode="group",
-        title="Two-Day Metric Comparison"
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def render_multi_day_analysis(metrics_df):
-    st.subheader("Date-Wise Trend Analysis")
-
-    if metrics_df.empty:
-        st.info("No data available.")
-        return
-
-    daily = metrics_df.groupby("Date").sum(numeric_only=True).reset_index()
-
-    trend_metrics = [
-        "Total Messages",
-        "Active Members",
-        "Questions Asked",
-        "Unanswered Questions",
-        "High Intent Messages",
-        "Negative Cases"
-    ]
-
-    available_metrics = [m for m in trend_metrics if m in daily.columns]
-
-    selected_metric = st.selectbox(
-        "Select trend metric",
-        available_metrics,
-        index=0
-    )
-
-    fig = px.line(
-        daily,
-        x="Date",
-        y=selected_metric,
-        markers=True,
-        title=f"Daily Trend: {selected_metric}"
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.dataframe(daily, use_container_width=True)
-
-
-def render_charts(filtered_df, metrics_df, topic_summary, hourly_summary):
+def render_charts(filtered_df, metrics_df, topic_summary, hourly_summary, title_prefix=""):
     st.subheader("Visual Analytics")
 
     col1, col2 = st.columns(2)
 
     with col1:
         if not metrics_df.empty:
-            msg_by_community = (
-                metrics_df
-                .groupby("Community")["Total Messages"]
-                .sum()
-                .reset_index()
-                .sort_values("Total Messages", ascending=False)
-            )
+            daily = metrics_df.groupby("Date")["Total Messages"].sum().reset_index()
+
             fig = px.bar(
-                msg_by_community,
-                x="Community",
+                daily,
+                x="Date",
                 y="Total Messages",
-                title="Messages by Community"
+                title=f"{title_prefix}Daily Messages"
             )
             st.plotly_chart(fig, use_container_width=True)
 
@@ -1083,11 +1168,12 @@ def render_charts(filtered_df, metrics_df, topic_summary, hourly_summary):
                 .reset_index()
                 .sort_values("Message Count", ascending=False)
             )
+
             fig = px.pie(
                 topic_total,
                 names="Topic",
                 values="Message Count",
-                title="Topic Distribution"
+                title=f"{title_prefix}Topic Distribution"
             )
             st.plotly_chart(fig, use_container_width=True)
 
@@ -1101,11 +1187,12 @@ def render_charts(filtered_df, metrics_df, topic_summary, hourly_summary):
                 .size()
                 .reset_index(name="Messages")
             )
+
             fig = px.bar(
                 sentiment,
                 x="Sentiment",
                 y="Messages",
-                title="Sentiment Distribution"
+                title=f"{title_prefix}Sentiment Distribution"
             )
             st.plotly_chart(fig, use_container_width=True)
 
@@ -1117,14 +1204,536 @@ def render_charts(filtered_df, metrics_df, topic_summary, hourly_summary):
                 .sum()
                 .reset_index()
             )
+
             fig = px.line(
                 hourly_total,
                 x="Hour",
                 y="Messages",
                 markers=True,
-                title="Hourly Activity"
+                title=f"{title_prefix}Hourly Activity"
             )
             st.plotly_chart(fig, use_container_width=True)
+
+
+def prepare_report_data(df):
+    metrics_df = build_daily_community_metrics(df)
+    topic_summary = build_topic_summary(df)
+    top_members = build_top_members(df)
+    hourly_summary = build_hourly_summary(df)
+    questions_df = get_questions_tracker(df)
+    high_intent_df = get_high_intent_tracker(df)
+    negative_df = get_negative_tracker(df)
+    important_df = get_important_messages(df, limit=200)
+
+    return {
+        "metrics_df": metrics_df,
+        "topic_summary": topic_summary,
+        "top_members": top_members,
+        "hourly_summary": hourly_summary,
+        "questions_df": questions_df,
+        "high_intent_df": high_intent_df,
+        "negative_df": negative_df,
+        "important_df": important_df,
+    }
+
+
+def render_community_page(
+    community_name,
+    community_df,
+    admin_names,
+    start_date,
+    end_date
+):
+    st.header(f"📌 {community_name}")
+
+    data = prepare_report_data(community_df)
+
+    metrics_df = data["metrics_df"]
+    topic_summary = data["topic_summary"]
+    top_members = data["top_members"]
+    hourly_summary = data["hourly_summary"]
+    questions_df = data["questions_df"]
+    high_intent_df = data["high_intent_df"]
+    negative_df = data["negative_df"]
+    important_df = data["important_df"]
+    admin_announcements = detect_admin_announcements(community_df, admin_names=admin_names)
+
+    render_kpis(metrics_df, community_df)
+
+    st.markdown("---")
+
+    day_count = (end_date - start_date).days + 1
+
+    if day_count == 2:
+        st.subheader("Two-Day Comparison for This Community")
+
+        daily = metrics_df.groupby("Date").sum(numeric_only=True).reset_index()
+
+        if daily["Date"].nunique() == 2:
+            d1, d2 = sorted(daily["Date"].unique())
+
+            comparison_metrics = [
+                "Total Messages",
+                "Active Members",
+                "Questions Asked",
+                "Questions Answered",
+                "Unanswered Questions",
+                "High Intent Messages",
+                "Negative Cases",
+                "Media Shared",
+                "Links Shared",
+                "Matched Student Messages",
+                "Unique Matched Students"
+            ]
+
+            rows = []
+
+            row1 = daily[daily["Date"] == d1].iloc[0]
+            row2 = daily[daily["Date"] == d2].iloc[0]
+
+            for metric in comparison_metrics:
+                v1 = int(row1.get(metric, 0))
+                v2 = int(row2.get(metric, 0))
+                change = v2 - v1
+
+                pct_change = ""
+                if v1 != 0:
+                    pct_change = f"{((v2 - v1) / v1) * 100:.1f}%"
+
+                rows.append({
+                    "Metric": metric,
+                    d1.strftime("%d %b %Y"): v1,
+                    d2.strftime("%d %b %Y"): v2,
+                    "Change": change,
+                    "% Change": pct_change
+                })
+
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+        else:
+            st.info("Only one selected day has data for this community.")
+
+    elif day_count >= 3:
+        st.subheader("Date-Wise Data for This Community")
+        daily = metrics_df.groupby("Date").sum(numeric_only=True).reset_index()
+
+        if not daily.empty:
+            selected_metric = st.selectbox(
+                f"Select trend metric for {community_name}",
+                [
+                    "Total Messages",
+                    "Active Members",
+                    "Questions Asked",
+                    "Unanswered Questions",
+                    "High Intent Messages",
+                    "Negative Cases",
+                    "Unique Matched Students"
+                ],
+                key=f"trend_metric_{community_name}"
+            )
+
+            if selected_metric in daily.columns:
+                fig = px.line(
+                    daily,
+                    x="Date",
+                    y=selected_metric,
+                    markers=True,
+                    title=f"{community_name} - {selected_metric} Trend"
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+        st.dataframe(metrics_df, use_container_width=True)
+
+    else:
+        st.subheader("Single-Day Data for This Community")
+        st.dataframe(metrics_df, use_container_width=True)
+
+    render_charts(
+        filtered_df=community_df,
+        metrics_df=metrics_df,
+        topic_summary=topic_summary,
+        hourly_summary=hourly_summary,
+        title_prefix=f"{community_name} - "
+    )
+
+    st.markdown("---")
+
+    sub_tabs = st.tabs([
+        "Daily Metrics",
+        "Topics",
+        "Top Members",
+        "Matched Students",
+        "Questions",
+        "High Intent",
+        "Negative Cases",
+        "Announcements",
+        "Important Conversations",
+        "Raw Data"
+    ])
+
+    with sub_tabs[0]:
+        st.dataframe(metrics_df, use_container_width=True)
+
+    with sub_tabs[1]:
+        st.dataframe(topic_summary, use_container_width=True)
+
+    with sub_tabs[2]:
+        top_n = st.slider(
+            f"Top N members - {community_name}",
+            min_value=5,
+            max_value=50,
+            value=10,
+            key=f"top_n_{community_name}"
+        )
+
+        display_top = (
+            top_members
+            .groupby(["Date", "Community"])
+            .head(top_n)
+            .reset_index(drop=True)
+        )
+
+        st.dataframe(display_top, use_container_width=True)
+
+    with sub_tabs[3]:
+        matched = community_df[
+            (~community_df["IsSystem"])
+            & (community_df["IsStudentMatched"])
+        ][[
+            "Date", "Time", "Community", "DisplayName", "Sender",
+            "SenderPhone", "MatchedStudentName", "Message"
+        ]].copy()
+
+        unmatched = community_df[
+            (~community_df["IsSystem"])
+            & (~community_df["IsStudentMatched"])
+        ][[
+            "Date", "Time", "Community", "Sender",
+            "SenderPhone", "Message"
+        ]].copy()
+
+        c1, c2 = st.columns(2)
+        c1.metric("Matched Student Messages", len(matched))
+        c2.metric("Unmatched Messages", len(unmatched))
+
+        st.markdown("#### Matched Student Messages")
+        st.dataframe(matched, use_container_width=True)
+
+        st.markdown("#### Unmatched Senders")
+        st.dataframe(unmatched, use_container_width=True)
+
+    with sub_tabs[4]:
+        st.dataframe(questions_df, use_container_width=True)
+
+        unanswered = questions_df[questions_df["QuestionAnswered"] == False]
+        if not unanswered.empty:
+            st.warning(f"{len(unanswered)} unanswered question(s) detected.")
+            st.dataframe(unanswered, use_container_width=True)
+
+    with sub_tabs[5]:
+        st.dataframe(high_intent_df, use_container_width=True)
+
+    with sub_tabs[6]:
+        st.dataframe(negative_df, use_container_width=True)
+
+    with sub_tabs[7]:
+        st.dataframe(admin_announcements, use_container_width=True)
+
+    with sub_tabs[8]:
+        st.dataframe(important_df, use_container_width=True)
+
+    with sub_tabs[9]:
+        raw_cols = [
+            "DateTime", "Date", "Time", "Community", "Sender", "DisplayName",
+            "SenderPhone", "MatchedStudentName", "IsStudentMatched",
+            "Message", "IsSystem", "IsQuestion", "QuestionAnswered",
+            "NeedsFollowUp", "IsHighIntent", "Sentiment", "TopicPrimary",
+            "HasLink", "IsMedia"
+        ]
+
+        st.dataframe(community_df[raw_cols], use_container_width=True)
+
+    st.markdown("---")
+
+    st.subheader(f"Download Report - {community_name}")
+
+    html_report = build_html_report(
+        title=f"{community_name} - WhatsApp Community Report",
+        filtered_df=community_df,
+        metrics_df=metrics_df,
+        topic_summary=topic_summary,
+        top_members=top_members,
+        questions_df=questions_df,
+        high_intent_df=high_intent_df,
+        negative_df=negative_df,
+        important_df=important_df,
+        admin_announcements=admin_announcements,
+        start_date=start_date,
+        end_date=end_date
+    )
+
+    excel_report = build_excel_report(
+        metrics_df=metrics_df,
+        topic_summary=topic_summary,
+        top_members=top_members,
+        questions_df=questions_df,
+        high_intent_df=high_intent_df,
+        negative_df=negative_df,
+        important_df=important_df,
+        admin_announcements=admin_announcements,
+        raw_df=community_df
+    )
+
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", community_name).strip("_")
+    report_name_base = f"{safe_name}_report_{start_date.strftime('%Y%m%d')}_to_{end_date.strftime('%Y%m%d')}"
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.download_button(
+            label="Download HTML Report",
+            data=html_report.encode("utf-8"),
+            file_name=f"{report_name_base}.html",
+            mime="text/html",
+            use_container_width=True,
+            key=f"html_{community_name}"
+        )
+
+    with c2:
+        st.download_button(
+            label="Download Excel Report",
+            data=excel_report,
+            file_name=f"{report_name_base}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key=f"excel_{community_name}"
+        )
+
+
+def render_all_groups_comparison(
+    filtered_df,
+    admin_names,
+    start_date,
+    end_date
+):
+    st.header("📊 All Groups Comparison")
+
+    data = prepare_report_data(filtered_df)
+
+    metrics_df = data["metrics_df"]
+    topic_summary = data["topic_summary"]
+    top_members = data["top_members"]
+    hourly_summary = data["hourly_summary"]
+    questions_df = data["questions_df"]
+    high_intent_df = data["high_intent_df"]
+    negative_df = data["negative_df"]
+    important_df = data["important_df"]
+    admin_announcements = detect_admin_announcements(filtered_df, admin_names=admin_names)
+
+    if metrics_df.empty:
+        st.info("No comparison data available.")
+        return
+
+    comparison = (
+        metrics_df
+        .groupby("Community")
+        .agg({
+            "Total Messages": "sum",
+            "Active Members": "sum",
+            "Unique Matched Students": "sum",
+            "Questions Asked": "sum",
+            "Questions Answered": "sum",
+            "Unanswered Questions": "sum",
+            "High Intent Messages": "sum",
+            "Negative Cases": "sum",
+            "Media Shared": "sum",
+            "Links Shared": "sum",
+            "New Member Events": "sum",
+            "Left / Removed Events": "sum",
+            "Community Health Score": "mean"
+        })
+        .reset_index()
+    )
+
+    comparison["Community Health Score"] = comparison["Community Health Score"].round(1)
+    comparison["Overall Health"] = comparison["Community Health Score"].apply(health_label)
+
+    st.subheader("Group-Wise Comparison Table")
+    st.dataframe(comparison, use_container_width=True)
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        fig = px.bar(
+            comparison.sort_values("Total Messages", ascending=False),
+            x="Community",
+            y="Total Messages",
+            title="Total Messages by Group"
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        fig = px.bar(
+            comparison.sort_values("Active Members", ascending=False),
+            x="Community",
+            y="Active Members",
+            title="Active Members by Group"
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    col3, col4 = st.columns(2)
+
+    with col3:
+        fig = px.bar(
+            comparison.sort_values("High Intent Messages", ascending=False),
+            x="Community",
+            y="High Intent Messages",
+            title="High Intent Messages by Group"
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col4:
+        fig = px.bar(
+            comparison.sort_values("Negative Cases", ascending=False),
+            x="Community",
+            y="Negative Cases",
+            title="Negative Cases by Group"
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
+    st.subheader("Date-Wise Group Comparison")
+
+    daily_group = (
+        metrics_df
+        .groupby(["Date", "Community"])
+        .sum(numeric_only=True)
+        .reset_index()
+    )
+
+    metric_options = [
+        "Total Messages",
+        "Active Members",
+        "Unique Matched Students",
+        "Questions Asked",
+        "Unanswered Questions",
+        "High Intent Messages",
+        "Negative Cases"
+    ]
+
+    selected_metric = st.selectbox(
+        "Select metric to compare across groups",
+        metric_options,
+        key="all_groups_metric"
+    )
+
+    if selected_metric in daily_group.columns:
+        fig = px.line(
+            daily_group,
+            x="Date",
+            y=selected_metric,
+            color="Community",
+            markers=True,
+            title=f"Date-Wise Comparison: {selected_metric}"
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.dataframe(daily_group, use_container_width=True)
+
+    st.markdown("---")
+
+    st.subheader("Cross-Group Detailed Tables")
+
+    tabs = st.tabs([
+        "Daily Metrics",
+        "Topics",
+        "Top Members",
+        "Questions",
+        "High Intent",
+        "Negative Cases",
+        "Announcements",
+        "Important Conversations"
+    ])
+
+    with tabs[0]:
+        st.dataframe(metrics_df, use_container_width=True)
+
+    with tabs[1]:
+        st.dataframe(topic_summary, use_container_width=True)
+
+    with tabs[2]:
+        st.dataframe(top_members, use_container_width=True)
+
+    with tabs[3]:
+        st.dataframe(questions_df, use_container_width=True)
+
+    with tabs[4]:
+        st.dataframe(high_intent_df, use_container_width=True)
+
+    with tabs[5]:
+        st.dataframe(negative_df, use_container_width=True)
+
+    with tabs[6]:
+        st.dataframe(admin_announcements, use_container_width=True)
+
+    with tabs[7]:
+        st.dataframe(important_df, use_container_width=True)
+
+    st.markdown("---")
+
+    st.subheader("Download All Groups Comparison Report")
+
+    html_report = build_html_report(
+        title="All Groups Comparison - WhatsApp Community Report",
+        filtered_df=filtered_df,
+        metrics_df=metrics_df,
+        topic_summary=topic_summary,
+        top_members=top_members,
+        questions_df=questions_df,
+        high_intent_df=high_intent_df,
+        negative_df=negative_df,
+        important_df=important_df,
+        admin_announcements=admin_announcements,
+        start_date=start_date,
+        end_date=end_date
+    )
+
+    excel_report = build_excel_report(
+        metrics_df=metrics_df,
+        topic_summary=topic_summary,
+        top_members=top_members,
+        questions_df=questions_df,
+        high_intent_df=high_intent_df,
+        negative_df=negative_df,
+        important_df=important_df,
+        admin_announcements=admin_announcements,
+        raw_df=filtered_df
+    )
+
+    report_name_base = f"all_groups_comparison_{start_date.strftime('%Y%m%d')}_to_{end_date.strftime('%Y%m%d')}"
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.download_button(
+            label="Download All Groups HTML Report",
+            data=html_report.encode("utf-8"),
+            file_name=f"{report_name_base}.html",
+            mime="text/html",
+            use_container_width=True,
+            key="all_groups_html"
+        )
+
+    with c2:
+        st.download_button(
+            label="Download All Groups Excel Report",
+            data=excel_report,
+            file_name=f"{report_name_base}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="all_groups_excel"
+        )
 
 
 # =========================
@@ -1132,11 +1741,13 @@ def render_charts(filtered_df, metrics_df, topic_summary, hourly_summary):
 # =========================
 
 def main():
-    st.title("💬 WhatsApp Community 24H Report Generator")
+    st.title("💬 WhatsApp Community Report Generator")
     st.caption(
-        "Upload 5 or more WhatsApp chat exports, select a date range, compare days, "
-        "and download a professional community report."
+        "Upload 5 or more WhatsApp chat exports, select a date range, open each community separately, "
+        "and compare all groups in one dedicated comparison tab."
     )
+
+    phone_mapping, students_df, phone_error = load_students_phone_mapping()
 
     with st.sidebar:
         st.header("Upload & Settings")
@@ -1147,6 +1758,20 @@ def main():
             accept_multiple_files=True,
             help="Upload exports from 5 or more WhatsApp communities."
         )
+
+        st.markdown("---")
+
+        if phone_error:
+            st.warning(phone_error)
+        else:
+            st.success(f"Loaded students_phone.xlsx · {len(phone_mapping):,} phone match keys")
+
+            with st.expander("Preview detected student phone sheet"):
+                preview_cols = [
+                    c for c in students_df.columns
+                    if not str(c).startswith("_Detected")
+                ]
+                st.dataframe(students_df[preview_cols].head(20), use_container_width=True)
 
         st.markdown("---")
 
@@ -1165,7 +1790,7 @@ def main():
         )
 
         st.markdown("---")
-        st.caption("Tip: export each WhatsApp community as `.txt` without media for faster upload.")
+        st.caption("Tip: export WhatsApp chats as `.txt` without media for faster upload.")
 
     if not uploaded_files:
         st.info("Upload WhatsApp `.txt` exports to start.")
@@ -1173,15 +1798,16 @@ def main():
 
     if len(uploaded_files) < 5:
         st.warning(
-            f"You uploaded {len(uploaded_files)} file(s). The app supports this, "
+            f"You uploaded {len(uploaded_files)} file(s). The app supports it, "
             "but your use case mentions 5 or more communities."
         )
 
     all_dfs = []
 
-    with st.spinner("Parsing WhatsApp exports..."):
+    with st.spinner("Parsing WhatsApp exports and matching student names..."):
         for file in uploaded_files:
             community_name = file.name.replace(".txt", "").replace("_", " ").strip()
+
             text = decode_file(file)
             parsed = parse_whatsapp_export(text, community_name)
 
@@ -1197,9 +1823,11 @@ def main():
     df = pd.concat(all_dfs, ignore_index=True)
     df = df.sort_values("DateTime").reset_index(drop=True)
 
+    df = enrich_with_student_names(df, phone_mapping)
     df = extract_features(df)
 
     admin_names = [x.strip() for x in admin_input.splitlines() if x.strip()]
+
     df = mark_answered_questions(
         df,
         admin_names=admin_names,
@@ -1254,158 +1882,34 @@ def main():
         st.warning("No messages found for the selected date range.")
         return
 
-    metrics_df = build_daily_community_metrics(filtered_df)
-    topic_summary = build_topic_summary(filtered_df)
-    top_members = build_top_members(filtered_df)
-    hourly_summary = build_hourly_summary(filtered_df)
-    questions_df = get_questions_tracker(filtered_df)
-    high_intent_df = get_high_intent_tracker(filtered_df)
-    negative_df = get_negative_tracker(filtered_df)
-    important_df = get_important_messages(filtered_df, limit=200)
-    admin_announcements = detect_admin_announcements(filtered_df, admin_names=admin_names)
+    communities = sorted(filtered_df["Community"].dropna().unique().tolist())
 
-    day_count = (end_date - start_date).days + 1
-    selected_dates = sorted(filtered_df["Date"].unique())
+    if not communities:
+        st.warning("No communities found.")
+        return
 
-    render_overview_kpis(metrics_df, filtered_df)
+    tab_labels = communities + ["All Groups Comparison"]
+    main_tabs = st.tabs(tab_labels)
 
-    st.markdown("---")
+    for i, community_name in enumerate(communities):
+        with main_tabs[i]:
+            community_df = filtered_df[filtered_df["Community"] == community_name].copy()
 
-    if day_count == 2:
-        render_two_day_comparison(metrics_df, selected_dates)
-    elif day_count >= 3:
-        render_multi_day_analysis(metrics_df)
-    else:
-        st.subheader("Single-Day Report")
-        st.dataframe(metrics_df, use_container_width=True)
+            render_community_page(
+                community_name=community_name,
+                community_df=community_df,
+                admin_names=admin_names,
+                start_date=start_date,
+                end_date=end_date
+            )
 
-    st.markdown("---")
-
-    render_charts(filtered_df, metrics_df, topic_summary, hourly_summary)
-
-    st.markdown("---")
-
-    tabs = st.tabs([
-        "Daily Metrics",
-        "Topics",
-        "Top Members",
-        "Questions",
-        "High Intent",
-        "Negative Cases",
-        "Admin Announcements",
-        "Important Conversations",
-        "Raw Parsed Data"
-    ])
-
-    with tabs[0]:
-        st.subheader("Community-Wise Daily Metrics")
-        st.dataframe(metrics_df, use_container_width=True)
-
-    with tabs[1]:
-        st.subheader("Topic Summary")
-        st.dataframe(topic_summary, use_container_width=True)
-
-    with tabs[2]:
-        st.subheader("Top Active Members")
-        top_n = st.slider("Show top N members per date/community", 5, 50, 10)
-        display_top_members = (
-            top_members
-            .groupby(["Date", "Community"])
-            .head(top_n)
-            .reset_index(drop=True)
+    with main_tabs[-1]:
+        render_all_groups_comparison(
+            filtered_df=filtered_df,
+            admin_names=admin_names,
+            start_date=start_date,
+            end_date=end_date
         )
-        st.dataframe(display_top_members, use_container_width=True)
-
-    with tabs[3]:
-        st.subheader("Questions Tracker")
-        st.dataframe(questions_df, use_container_width=True)
-
-        unanswered_df = questions_df[questions_df["QuestionAnswered"] == False]
-        if not unanswered_df.empty:
-            st.warning(f"{len(unanswered_df)} unanswered question(s) detected.")
-            st.dataframe(unanswered_df, use_container_width=True)
-
-    with tabs[4]:
-        st.subheader("High Intent / Lead Signals")
-        st.dataframe(high_intent_df, use_container_width=True)
-
-    with tabs[5]:
-        st.subheader("Negative Sentiment / Risk Cases")
-        st.dataframe(negative_df, use_container_width=True)
-
-    with tabs[6]:
-        st.subheader("Admin Announcements / Important Updates")
-        st.dataframe(admin_announcements, use_container_width=True)
-
-    with tabs[7]:
-        st.subheader("Important Conversations")
-        st.dataframe(important_df, use_container_width=True)
-
-    with tabs[8]:
-        st.subheader("Raw Parsed Data")
-        raw_cols = [
-            "DateTime", "Date", "Time", "Community", "Sender", "Message",
-            "IsSystem", "IsQuestion", "QuestionAnswered", "NeedsFollowUp",
-            "IsHighIntent", "Sentiment", "TopicPrimary", "HasLink", "IsMedia"
-        ]
-        st.dataframe(filtered_df[raw_cols], use_container_width=True)
-
-    st.markdown("---")
-
-    st.subheader("Download Professional Report")
-
-    html_report = build_html_report(
-        filtered_df=filtered_df,
-        metrics_df=metrics_df,
-        topic_summary=topic_summary,
-        top_members=top_members,
-        questions_df=questions_df,
-        high_intent_df=high_intent_df,
-        negative_df=negative_df,
-        important_df=important_df,
-        admin_announcements=admin_announcements,
-        start_date=start_date,
-        end_date=end_date
-    )
-
-    excel_report = build_excel_report(
-        metrics_df=metrics_df,
-        topic_summary=topic_summary,
-        top_members=top_members,
-        questions_df=questions_df,
-        high_intent_df=high_intent_df,
-        negative_df=negative_df,
-        important_df=important_df,
-        admin_announcements=admin_announcements,
-        raw_df=filtered_df
-    )
-
-    report_name_base = f"whatsapp_community_report_{start_date.strftime('%Y%m%d')}_to_{end_date.strftime('%Y%m%d')}"
-
-    c1, c2 = st.columns(2)
-
-    with c1:
-        st.download_button(
-            label="Download Professional HTML Report",
-            data=html_report.encode("utf-8"),
-            file_name=f"{report_name_base}.html",
-            mime="text/html",
-            use_container_width=True
-        )
-
-    with c2:
-        st.download_button(
-            label="Download Excel Data Report",
-            data=excel_report,
-            file_name=f"{report_name_base}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
-
-    st.caption(
-        "HTML report is designed for leadership sharing and can be opened in browser or printed as PDF. "
-        "Excel report contains all tables for deeper analysis."
-    )
 
 
 if __name__ == "__main__":
